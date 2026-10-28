@@ -13,6 +13,7 @@
 #include <QCheckBox>
 #include <QPlainTextEdit>
 #include <QStyle>
+#include <QFontInfo>
 #include <QJsonDocument>
 #include <QJsonValue>
 #include <QDateTime>
@@ -24,9 +25,9 @@
 // Contrato con el firmware de la Práctica 2 (practica4.ino de 2026A, puerto 81):
 //   Qt -> ESP32  {"tipo":"latido"}
 //                {"tipo":"mover","accion":"avanzar|retroceder|izquierda|derecha|parar","ms":400}
-//                {"tipo":"servo","angulo":0..180}
+//                {"tipo":"servo","angulo":60..120}  (límite del firmware P2-1.1.0)
 //                {"tipo":"leer_distancia"}
-//                {"tipo":"scan","angulo":0..180}
+//                {"tipo":"scan","angulo":60..120}
 //   ESP32 -> Qt  saludo, latido_ok, mover_ack / mover_err, mover_inicio, mover_fin,
 //                {"tipo":"distancia_lectura","d":cm}, {"tipo":"scan","d":cm,"angulo":n}, telemetria
 // El firmware reemplaza el movimiento en curso cuando llega una orden nueva, así que
@@ -35,10 +36,14 @@
 static const int MS_MOVIMIENTO = 400;   // duración de cada orden "mover"
 static const int MS_REPETIR = 200;      // cada cuánto se reenvía mientras se presiona
 static const int VENTANA_MUESTRAS = 40; // puntos visibles en la gráfica
+// Rango que acepta el firmware P2-1.1.0 (robot_logic.h: SERVO_MIN/SERVO_MAX)
+static const int SERVO_MIN = 60;
+static const int SERVO_MAX = 120;
+static const int PASO_BARRIDO = 15;
 
 // Regla antiplagio de la Práctica 3: escribe aquí tu nombre y tu código.
 // Debe verse en todas tus capturas del teléfono.
-static const char *ALUMNO = "Nombre Apellido · 000000000";
+static const char *ALUMNO = "Edgar Ulises Reynoso Gonzalez · 223823098";
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -113,7 +118,7 @@ void MainWindow::construirInterfaz()
     auto *cajaServo = new QGroupBox(tr("Servo del sensor"));
     auto *filaServo = new QHBoxLayout(cajaServo);
     m_slider = new QSlider(Qt::Horizontal);
-    m_slider->setRange(0, 180);
+    m_slider->setRange(SERVO_MIN, SERVO_MAX);
     m_slider->setValue(90);
     m_angulo = new QLabel(QStringLiteral("90°"));
     m_angulo->setMinimumWidth(48);
@@ -131,7 +136,8 @@ void MainWindow::construirInterfaz()
     auto *filaDist = new QHBoxLayout;
     m_distancia = new QLabel(QStringLiteral("— cm"));
     QFont grande = m_distancia->font();
-    grande.setPointSize(grande.pointSize() + 6);
+    // En Android la fuente viene en píxeles (pointSize() = -1): se parte del tamaño real
+    grande.setPointSizeF(QFontInfo(grande).pointSizeF() + 6);
     grande.setBold(true);
     m_distancia->setFont(grande);
     auto *medir = new QPushButton(tr("Medir"));
@@ -265,7 +271,10 @@ void MainWindow::alRecibirMensaje(const QString &texto)
     const QJsonObject obj = QJsonDocument::fromJson(texto.toUtf8()).object();
     const QString tipo = obj.value("tipo").toString();
 
-    if (tipo == "distancia_lectura") {
+    if ((tipo == "distancia_lectura" || tipo == "scan") && obj.value("d").isNull()) {
+        // lectura sin eco (ok:false): no se grafica como 0 cm
+        registrar(tr("lectura inválida: %1").arg(obj.value("motivo").toString()));
+    } else if (tipo == "distancia_lectura") {
         agregarDistancia(obj.value("d").toDouble());
     } else if (tipo == "scan") {
         agregarDistancia(obj.value("d").toDouble());
@@ -305,14 +314,14 @@ void MainWindow::alPresionarMedir()
 
 void MainWindow::alPresionarBarrido()
 {
-    m_anguloBarrido = 0;
+    m_anguloBarrido = SERVO_MIN;
     m_barrido.start();
     siguientePasoBarrido();
 }
 
 void MainWindow::siguientePasoBarrido()
 {
-    if (m_anguloBarrido > 180) {
+    if (m_anguloBarrido > SERVO_MAX) {
         m_barrido.stop();
         return;
     }
@@ -321,7 +330,7 @@ void MainWindow::siguientePasoBarrido()
     m_slider->setValue(m_anguloBarrido);
     m_slider->blockSignals(false);
     m_angulo->setText(QStringLiteral("%1°").arg(m_anguloBarrido));
-    m_anguloBarrido += 30;
+    m_anguloBarrido += PASO_BARRIDO;
 }
 
 void MainWindow::agregarDistancia(double cm)
