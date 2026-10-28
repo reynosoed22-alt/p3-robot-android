@@ -40,6 +40,10 @@ static const int VENTANA_MUESTRAS = 40; // puntos visibles en la gráfica
 static const int SERVO_MIN = 60;
 static const int SERVO_MAX = 120;
 static const int PASO_BARRIDO = 15;
+// Extra P3: límites de la ruta grabada
+static const int MAX_PASOS = 40;        // pasos que caben en una ruta
+static const int MAX_PAUSA_MS = 3000;   // pausas más largas se recortan al repetir
+static const int MIN_PASO_MS = 100;     // toques más cortos se ignoran
 
 // Regla antiplagio de la Práctica 3: escribe aquí tu nombre y tu código.
 // Debe verse en todas tus capturas del teléfono.
@@ -70,6 +74,9 @@ MainWindow::MainWindow(QWidget *parent)
 
     m_barrido.setInterval(700);   // el firmware espera 500 ms antes de medir en cada "scan"
     connect(&m_barrido, &QTimer::timeout, this, &MainWindow::siguientePasoBarrido);
+
+    m_ruta.setSingleShot(true);
+    connect(&m_ruta, &QTimer::timeout, this, &MainWindow::siguientePasoRuta);
 }
 
 // ---------------------------------------------------------------- interfaz
@@ -113,6 +120,31 @@ void MainWindow::construirInterfaz()
     cruceta->addWidget(botonMovimiento(QStyle::SP_ArrowRight, "derecha"), 1, 2);
     cruceta->addWidget(botonMovimiento(QStyle::SP_ArrowDown, "retroceder"), 2, 1);
     raiz->addWidget(cajaMover);
+
+    // 2b) Extra P3: grabar la secuencia de botones y repetirla en el robot
+    auto *cajaRuta = new QGroupBox(tr("Ruta (grabar y repetir)"));
+    auto *colRuta = new QVBoxLayout(cajaRuta);
+    auto *filaRuta = new QHBoxLayout;
+    m_grabar = new QPushButton(tr("Grabar"));
+    m_repetirRuta = new QPushButton(tr("Repetir"));
+    m_borrarRuta = new QPushButton(tr("Borrar"));
+    for (auto *b : {m_grabar, m_repetirRuta, m_borrarRuta}) {
+        b->setMinimumHeight(48);
+        filaRuta->addWidget(b);
+    }
+    m_infoRuta = new QLabel;
+    m_infoRuta->setAlignment(Qt::AlignCenter);
+    colRuta->addLayout(filaRuta);
+    colRuta->addWidget(m_infoRuta);
+    connect(m_grabar, &QPushButton::clicked, this, &MainWindow::alPresionarGrabar);
+    connect(m_repetirRuta, &QPushButton::clicked, this, &MainWindow::alPresionarRepetir);
+    connect(m_borrarRuta, &QPushButton::clicked, this, [this] {
+        m_pasos.clear();
+        registrar(tr("ruta borrada"));
+        actualizarRuta();
+    });
+    raiz->addWidget(cajaRuta);
+    actualizarRuta();
 
     // 3) Servo
     auto *cajaServo = new QGroupBox(tr("Servo del sensor"));
@@ -192,6 +224,15 @@ QPushButton *MainWindow::botonMovimiento(QStyle::StandardPixmap icono, const QSt
     b->setAccessibleName(accion);   // nombre para lectores de pantalla y pruebas automáticas
     // pressed/released funcionan igual con el ratón y con el dedo
     connect(b, &QPushButton::pressed, this, [this, accion] {
+        // Extra P3: tocar la cruceta toma el control y cancela la repetición
+        if (m_pasoActual >= 0)
+            detenerRepeticion(tr("cancelada con la cruceta"));
+        if (m_grabando && accion != "parar") {
+            if (!m_pasos.isEmpty())   // la pausa antes del primer botón no se guarda
+                anotarPaso("pausa", m_reloj.elapsed());
+            m_accionGrabada = accion;
+            m_reloj.restart();
+        }
         if (accion == "parar") {
             m_repetir.stop();
             enviarMover("parar", 0);
@@ -205,6 +246,11 @@ QPushButton *MainWindow::botonMovimiento(QStyle::StandardPixmap icono, const QSt
         if (accion == "parar") return;
         m_repetir.stop();
         enviarMover("parar", 0);
+        if (m_grabando && m_accionGrabada == accion) {
+            anotarPaso(accion, m_reloj.elapsed());
+            m_accionGrabada.clear();
+            m_reloj.restart();   // desde aquí corre la pausa hasta el siguiente botón
+        }
     });
     return b;
 }
@@ -237,6 +283,8 @@ void MainWindow::alDesconectar()
     m_repetir.stop();
     m_medirAuto.stop();
     m_barrido.stop();
+    if (m_pasoActual >= 0)
+        detenerRepeticion(tr("se perdió la conexión"));
     m_auto->setChecked(false);
     m_estado->setText(tr("Desconectado"));
     m_conectar->setText(tr("Conectar"));
@@ -341,6 +389,100 @@ void MainWindow::agregarDistancia(double cm)
         m_serie->remove(0);   // ventana deslizante: el buffer no crece sin límite
     ++m_muestra;
     m_ejeX->setRange(qMax(0, m_muestra - VENTANA_MUESTRAS), qMax(VENTANA_MUESTRAS, m_muestra));
+}
+
+// ---------------------------------------------------------------- extra P3: ruta
+void MainWindow::alPresionarGrabar()
+{
+    if (m_pasoActual >= 0) return;
+    m_grabando = !m_grabando;
+    if (m_grabando) {
+        m_pasos.clear();
+        m_accionGrabada.clear();
+        m_reloj.start();
+        registrar(tr("grabando ruta: usa la cruceta"));
+    } else {
+        registrar(tr("ruta grabada: %1 pasos").arg(m_pasos.size()));
+    }
+    actualizarRuta();
+}
+
+void MainWindow::anotarPaso(const QString &accion, qint64 ms)
+{
+    if (ms < MIN_PASO_MS || m_pasos.size() >= MAX_PASOS)
+        return;
+    if (accion == "pausa")
+        ms = qMin<qint64>(ms, MAX_PAUSA_MS);
+    m_pasos.append({accion, int(ms)});
+    actualizarRuta();
+}
+
+void MainWindow::alPresionarRepetir()
+{
+    if (m_pasoActual >= 0) {   // el mismo botón sirve para detener
+        detenerRepeticion(tr("detenida por el usuario"));
+        return;
+    }
+    if (m_grabando || m_pasos.isEmpty()) return;
+    if (m_socket.state() != QAbstractSocket::ConnectedState) {
+        registrar(tr("conecta el robot antes de repetir la ruta"));
+        return;
+    }
+    registrar(tr("repitiendo ruta de %1 pasos").arg(m_pasos.size()));
+    m_pasoActual = 0;
+    siguientePasoRuta();
+}
+
+// Cada paso de movimiento reutiliza m_repetir, igual que si el dedo estuviera en el botón;
+// al terminar su duración se manda "parar" y sigue el siguiente paso.
+void MainWindow::siguientePasoRuta()
+{
+    m_repetir.stop();
+    if (m_pasoActual > 0 && m_pasos.at(m_pasoActual - 1).accion != "pausa")
+        enviarMover("parar", 0);
+    if (m_pasoActual >= m_pasos.size()) {
+        m_pasoActual = -1;
+        registrar(tr("ruta terminada"));
+        actualizarRuta();
+        return;
+    }
+    const PasoRuta paso = m_pasos.at(m_pasoActual);
+    registrar(tr("paso %1/%2: %3 %4 ms").arg(m_pasoActual + 1).arg(m_pasos.size())
+                  .arg(paso.accion).arg(paso.ms));
+    if (paso.accion != "pausa") {
+        m_accionActual = paso.accion;
+        enviarMover(paso.accion, qMin(MS_MOVIMIENTO, qMax(50, paso.ms)));
+        m_repetir.start();
+    }
+    ++m_pasoActual;
+    m_ruta.start(paso.ms);
+    actualizarRuta();
+}
+
+void MainWindow::detenerRepeticion(const QString &motivo)
+{
+    m_ruta.stop();
+    m_repetir.stop();
+    m_pasoActual = -1;
+    enviarMover("parar", 0);
+    registrar(tr("ruta detenida: %1").arg(motivo));
+    actualizarRuta();
+}
+
+void MainWindow::actualizarRuta()
+{
+    int totalMs = 0;
+    for (const auto &p : m_pasos) totalMs += p.ms;
+    const bool repitiendo = m_pasoActual >= 0;
+    QString texto = tr("%1 pasos · %2 s").arg(m_pasos.size()).arg(totalMs / 1000.0, 0, 'f', 1);
+    if (m_grabando) texto = tr("● Grabando · ") + texto;
+    else if (repitiendo) texto = tr("▶ Paso %1 de %2").arg(m_pasoActual).arg(m_pasos.size());
+    m_infoRuta->setText(texto);
+    m_grabar->setText(m_grabando ? tr("Terminar") : tr("Grabar"));
+    m_grabar->setEnabled(!repitiendo);
+    m_repetirRuta->setText(repitiendo ? tr("Detener") : tr("Repetir"));
+    m_repetirRuta->setEnabled(repitiendo || (!m_grabando && !m_pasos.isEmpty()));
+    m_borrarRuta->setEnabled(!m_grabando && !repitiendo && !m_pasos.isEmpty());
 }
 
 void MainWindow::registrar(const QString &linea)
